@@ -1,0 +1,100 @@
+# Color Shadow Lamp shows - Home Assistant package (optional).
+# The shows run on the lamp itself: ESPHome effects "Disco" and "Colour Show" (the latter is
+# RGB G-code, rgb_gcode.h). These two switches start and stop them, for dashboards and voice
+# ("turn on colour show"). Stopping puts the lamp back how it was: off if it was off, otherwise
+# the colour it had before (the lamp keeps that colour while a show runs, so "effect: None" is enough).
+# Install: put this file in /config/packages/ and enable packages in configuration.yaml:
+#   homeassistant:
+#     packages: !include_dir_named packages
+# If your lamp's entity id isn't light.color_shadow_lamp, replace it below.
+# New shows can be sent without a reflash:
+#   action: esphome.color_shadow_lamp_play   data: {program: "<RGB G-code>"}  -> effect "Custom"
+
+input_boolean:
+  color_shadow_lamp_was_off:
+    name: Color Shadow Lamp - off before the show
+    icon: mdi:lightbulb-off-outline
+
+script:
+  color_shadow_lamp_show_start:
+    alias: Color Shadow Lamp - start a show
+    mode: queued
+    fields:
+      effect:
+        description: Lamp effect to play
+        example: Colour Show
+    sequence:
+      # Remember "was it off?" unless this only swaps one show for the other.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ is_state('light.color_shadow_lamp', 'off')
+                 or state_attr('light.color_shadow_lamp', 'effect') not in ['Disco', 'Colour Show'] }}
+        then:
+          - action: >-
+              input_boolean.turn_{{ 'on' if is_state('light.color_shadow_lamp', 'off') else 'off' }}
+            target:
+              entity_id: input_boolean.color_shadow_lamp_was_off
+      - action: light.turn_on
+        target:
+          entity_id: light.color_shadow_lamp
+        data:
+          effect: "{{ effect }}"
+
+  color_shadow_lamp_show_stop:
+    alias: Color Shadow Lamp - stop a show
+    mode: queued
+    fields:
+      effect:
+        description: Only stops the lamp if this effect is what's playing
+        example: Colour Show
+    sequence:
+      - condition: template
+        value_template: "{{ is_state_attr('light.color_shadow_lamp', 'effect', effect) }}"
+      - if:
+          - condition: state
+            entity_id: input_boolean.color_shadow_lamp_was_off
+            state: "on"
+        then:
+          - action: light.turn_off
+            target:
+              entity_id: light.color_shadow_lamp
+        else:
+          - action: light.turn_on
+            target:
+              entity_id: light.color_shadow_lamp
+            data:
+              effect: "None"
+
+template:
+  - switch:
+      - name: Disco Mode
+        unique_id: color_shadow_lamp_disco_mode
+        icon: mdi:party-popper
+        availability: "{{ has_value('light.color_shadow_lamp') }}"
+        state: >-
+          {{ is_state('light.color_shadow_lamp', 'on')
+             and is_state_attr('light.color_shadow_lamp', 'effect', 'Disco') }}
+        turn_on:
+          - action: script.color_shadow_lamp_show_start
+            data:
+              effect: Disco
+        turn_off:
+          - action: script.color_shadow_lamp_show_stop
+            data:
+              effect: Disco
+      - name: Colour Show
+        unique_id: color_shadow_lamp_colour_show
+        icon: mdi:palette
+        availability: "{{ has_value('light.color_shadow_lamp') }}"
+        state: >-
+          {{ is_state('light.color_shadow_lamp', 'on')
+             and is_state_attr('light.color_shadow_lamp', 'effect', 'Colour Show') }}
+        turn_on:
+          - action: script.color_shadow_lamp_show_start
+            data:
+              effect: Colour Show
+        turn_off:
+          - action: script.color_shadow_lamp_show_stop
+            data:
+              effect: Colour Show

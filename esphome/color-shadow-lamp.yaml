@@ -1,0 +1,231 @@
+# rctestflight Color Shadow Lamp - ESPHome firmware with light shows
+# https://github.com/adrutu/Color-Shadow-Lamp/tree/main/esphome
+# Base: github.com/n2kbg/ESPHome-ColorShadowRGB (colorshadowrgb.yaml)
+# Hardware: ESP32-C3, analog RGB via 3x LEDC PWM (GPIO7/6/5), 3x pots on ADC
+# (GPIO4/3/0 - dials left out on purpose, see README), button on GPIO9. 12V in.
+# Needs rgb_gcode.h next to this file, and a secrets.yaml (see secrets.example.yaml).
+
+esphome:
+  name: color-shadow-lamp
+  friendly_name: Color Shadow Lamp
+  # RGB G-code show player: language + built-in "Colour Show" live in rgb_gcode.h
+  includes:
+    - rgb_gcode.h
+  on_boot:
+    - lambda: |-
+        auto &cs = rgb_gcode::colour_show();
+        id(lamp_program).publish_state(cs.ops.empty() ? std::string("Colour Show failed to load - see log")
+            : "Colour Show built in, " + std::to_string(cs.ops.size()) + " steps");
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret lamp_api_key
+  actions:
+    # HA: esphome.color_shadow_lamp_play, data: {program: "<RGB G-code>"} - plays it as
+    # effect "Custom" (restarts it if it's already playing). A bad program is rejected with the
+    # reason in the "Show program" sensor and the lamp carries on as it was.
+    - action: play
+      variables:
+        program: string
+      then:
+        - lambda: |-
+            std::string err = rgb_gcode::custom().load(program);
+            if (!err.empty()) {
+              ESP_LOGW("rgb_gcode", "program rejected: %s", err.c_str());
+              id(lamp_program).publish_state("Rejected, " + err);
+              return;
+            }
+            id(lamp_program).publish_state("Custom playing, " + std::to_string(rgb_gcode::custom().ops.size()) + " steps");
+            auto call = id(rgb_led).turn_on();
+            call.set_effect("Custom");
+            call.perform();
+
+ota:
+  - platform: esphome
+    password: !secret lamp_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # No fast_connect: a full scan at boot lets it pick the strongest access point
+  # when you have more than one with the same network name.
+
+  ap:
+    ssid: "Color Shadow Lamp Fallback"
+    password: !secret lamp_ap_password
+
+captive_portal:
+
+# No web_server: without auth it's an open control page for anyone on your network, and
+# HA doesn't need it. To bring it back, add web_server with auth: from !secret.
+
+text_sensor:
+  - platform: template
+    name: Scene
+    id: lamp_scene
+    icon: mdi:palette
+  - platform: template
+    name: Show program
+    id: lamp_program
+    icon: mdi:script-text-outline
+    entity_category: diagnostic
+
+globals:
+  - id: effect_type
+    type: int
+    initial_value: '0'
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO9        # shared with the C3 boot strap pin — see flashing notes
+      inverted: true
+    id: push_button
+    internal: true
+    on_double_click:
+      - min_length: 50ms
+        max_length: 750ms
+        then:
+          - light.toggle: rgb_led
+    on_press:
+      then:
+        - lambda: |-
+            id(effect_type) += 1;
+            auto call = id(rgb_led).turn_on();
+            switch (id(effect_type)) {
+              case 1: call.set_effect("pulse");   break;
+              case 2: call.set_effect("random");  break;
+              case 3: call.set_effect("flicker"); break;
+              default:
+                id(effect_type) = 0;
+                call.set_effect("None");
+                break;
+            }
+            call.perform();
+
+light:
+  - platform: rgb
+    name: None
+    id: rgb_led
+    on_state:
+      - lambda: |-
+          auto e = id(rgb_led).get_effect_name();
+          std::string name(e.c_str(), e.size());
+          if (name != "Colour Show" && name != "Custom" && !id(lamp_scene).state.empty())
+            id(lamp_scene).publish_state("");
+    red: output_red
+    green: output_green
+    blue: output_blue
+    effects:
+      - pulse:
+      - random:
+      - flicker:
+      # RGB G-code shows (rgb_gcode.h). Colour Show = the built-in tour; Custom = whatever HA
+      # last sent with the play action. The light's brightness scales both.
+      - lambda:
+          name: Colour Show
+          update_interval: 16ms
+          lambda: |-
+            auto *scene = rgb_gcode::frame(it, initial_run, rgb_gcode::colour_show());
+            if (scene != nullptr)
+              id(lamp_scene).publish_state(*scene);
+      - lambda:
+          name: Custom
+          update_interval: 16ms
+          lambda: |-
+            auto *scene = rgb_gcode::frame(it, initial_run, rgb_gcode::custom());
+            if (scene != nullptr)
+              id(lamp_scene).publish_state(*scene);
+      # Disco - started from HA (switch.disco_mode in home-assistant/color_shadow_lamp_shows.yaml).
+      # Runs on the lamp so the beat stays tight and HA sees one state change, not
+      # one per flash. The 3 LEDs sit apart, so lighting one at a time makes the
+      # coloured shadows jump. 125 BPM, one 4-bar phrase = 7.7 s:
+      #   bars 1-2  one LED per beat, hit then fade ("do, do, do, do")
+      #   bar 3     two-LED colours (yellow/cyan/magenta) on the eighth notes
+      #   bar 4     random colour every sixteenth, then 2 beats of strobe
+      # Every other phrase the chase runs backwards and the strobe uses single LEDs.
+      - lambda:
+          name: Disco
+          update_interval: 16ms
+          lambda: |-
+            static const float COL[7][3] = {
+                {1, 0, 0}, {0, 1, 0}, {0, 0, 1},  // one LED
+                {1, 1, 0}, {0, 1, 1}, {1, 0, 1},  // two LEDs
+                {1, 1, 1}};                       // all three
+            static uint32_t t0, last_n;
+            static int rnd, last_c;
+            static float last_b;
+            if (initial_run) {
+              t0 = millis();
+              last_n = UINT32_MAX;
+              rnd = 6;
+              last_c = -1;
+              last_b = -1.0f;
+            }
+            const uint32_t t = millis() - t0;
+            const uint32_t n = t / 120;  // sixteenth notes since start
+            const uint32_t step = n % 64;
+            const uint32_t beat = step / 4;
+            const bool odd = (n / 64) % 2;
+            int c;
+            float b;
+            if (beat < 8) {
+              const int i = beat % 3;
+              c = odd ? 2 - i : i;
+              const float d = 1.0f - (t % 480) / 480.0f;
+              b = 0.1f + 0.9f * d * d;
+            } else if (beat < 12) {
+              c = 3 + (step / 2) % 3;
+              const float d = 1.0f - (t % 240) / 240.0f;
+              b = 0.15f + 0.85f * d * d;
+            } else if (beat < 14) {
+              if (n != last_n) {
+                int k;
+                do {
+                  k = random_uint32() % 7;
+                } while (k == rnd);
+                rnd = k;
+                last_n = n;
+              }
+              c = rnd;
+              b = 1.0f;
+            } else {
+              c = odd ? step % 3 : 6;
+              b = (t % 120) < 40 ? 1.0f : 0.0f;
+            }
+            if (c == last_c && fabsf(b - last_b) < 0.005f)
+              return;
+            last_c = c;
+            last_b = b;
+            auto call = it.turn_on();
+            call.set_rgb(COL[c][0], COL[c][1], COL[c][2]);
+            // dark phase = brightness 0 with state kept on, or the effect would stop
+            call.set_brightness(b);
+            call.set_transition_length(0);
+            call.set_publish(false);
+            call.set_save(false);
+            call.perform();
+
+# No power limit here: the stock firmware caps total power at 30 % (60 % unlocked) so the
+# LED arms' ~63 C thermal cut-outs don't trip. Full white at full brightness can trip them
+# sooner - see README, "Heat and power".
+output:
+  - platform: ledc
+    id: output_red
+    pin: GPIO7
+    frequency: 1220Hz
+  - platform: ledc
+    id: output_green
+    pin: GPIO6
+    frequency: 1220Hz
+  - platform: ledc
+    id: output_blue
+    pin: GPIO5
+    frequency: 1220Hz
